@@ -19,7 +19,6 @@ from kombu.utils.objects import cached_property
 from kombu.utils.url import maybe_sanitize_url
 from redis.client import StrictRedis
 from tenacity import retry, retry_if_exception_type, stop_after_delay, wait_exponential
-
 from .decoder import RedBeatJSONDecoder, RedBeatJSONEncoder, to_timestamp
 
 logger = get_logger('celery.beat')
@@ -192,12 +191,14 @@ class RedBeatSchedulerEntry(ScheduleEntry):
     _meta = None
 
     def __init__(
-        self, name=None, task=None, schedule=None, args=None, kwargs=None, enabled=True, **clsargs
+        self, name=None, task=None, target=None, schedule=None, args=None, kwargs=None, enabled=True, run_immediately=False, **clsargs
     ):
         super().__init__(
             name=name, task=task, schedule=schedule, args=args, kwargs=kwargs, **clsargs
         )
-        self.enabled = enabled
+        self.run_immediately = str(run_immediately)
+        self.enabled = str(enabled)
+        self.target = target
         ensure_conf(self.app)
 
     @staticmethod
@@ -248,6 +249,43 @@ class RedBeatSchedulerEntry(ScheduleEntry):
 
         return entry
 
+    @classmethod
+    def get_schedules_by_target(cls, target, app=None):
+        ensure_conf(app)
+        connection = get_redis(app)
+        schedules_keys = connection.scan(0, f"*{target}*")
+        if not schedules_keys[1]:
+            return []
+        schedule_objects = []
+        for key in schedules_keys[1]:
+            connection = get_redis(app)
+            schedule_obj = connection.hgetall(key)
+            definition = cls.decode_definition(schedule_obj["definition"])
+            meta = cls.decode_definition(schedule_obj["meta"])
+            entry = cls(app=app, **definition)
+            entry.last_run_at = meta['last_run_at']
+            schedule_objects.append(entry)
+
+        return schedule_objects
+
+    @classmethod
+    def get_schedules(cls, app=None):
+        ensure_conf(app)
+        connection = get_redis(app)
+        schedules_keys = connection.scan(0, f"redbeat:sc4snmp;*")
+        if not schedules_keys[1]:
+            return []
+        schedule_objects = []
+        for key in schedules_keys[1]:
+            schedule_obj = connection.hgetall(key)
+            definition = cls.decode_definition(schedule_obj["definition"])
+            meta = cls.decode_definition(schedule_obj["meta"])
+            entry = cls(app=app, **definition)
+            entry.last_run_at = meta['last_run_at']
+            schedule_objects.append(entry)
+
+        return schedule_objects
+
     @property
     def due_at(self):
         # never run => due now
@@ -290,6 +328,7 @@ class RedBeatSchedulerEntry(ScheduleEntry):
             'options': self.options,
             'schedule': self.schedule,
             'enabled': self.enabled,
+            'run_immediately': self.run_immediately
         }
         meta = {
             'last_run_at': self.last_run_at,
@@ -298,6 +337,8 @@ class RedBeatSchedulerEntry(ScheduleEntry):
             pipe.hset(self.key, 'definition', json.dumps(definition, cls=RedBeatJSONEncoder))
             pipe.hsetnx(self.key, 'meta', json.dumps(meta, cls=RedBeatJSONEncoder))
             pipe.zadd(self.app.redbeat_conf.schedule_key, {self.key: self.score})
+            if self.run_immediately:
+                pipe.sadd("run_immediately", self.key)
             pipe.execute()
 
         return self
@@ -307,6 +348,12 @@ class RedBeatSchedulerEntry(ScheduleEntry):
             pipe.zrem(self.app.redbeat_conf.schedule_key, self.key)
             pipe.delete(self.key)
             pipe.execute()
+
+    def set_enable(self, enabled):
+        self.enabled = enabled
+
+    def set_run_immediately(self, run_immediately):
+        self.run_immediately = run_immediately
 
     def _next_instance(self, last_run_at=None, only_update_last_run_at=False):
         entry = super()._next_instance(last_run_at=last_run_at)
@@ -334,19 +381,39 @@ class RedBeatSchedulerEntry(ScheduleEntry):
         meta = {
             'last_run_at': self.last_run_at,
         }
+        definition = {
+            'name': self.name,
+            'task': self.task,
+            'args': self.args,
+            'kwargs': self.kwargs,
+            'options': self.options,
+            'schedule': self.schedule,
+            'target': self.target,
+            'enabled': self.enabled,
+            'run_immediately': self.run_immediately
+        }
         with get_redis(self.app).pipeline() as pipe:
             pipe.hset(self.key, 'meta', json.dumps(meta, cls=RedBeatJSONEncoder))
+            pipe.hset(self.key, 'definition', json.dumps(definition, cls=RedBeatJSONEncoder))
             pipe.zadd(self.app.redbeat_conf.schedule_key, {self.key: self.score})
+            if self.run_immediately:
+                pipe.sadd("run_immediately", self.key)
             pipe.execute()
 
     def is_due(self):
-        if not self.enabled:
+        if not self._strtobool(self.enabled):
             return False, 5.0  # 5 second delay for re-enable.
+
+        if self._strtobool(self.run_immediately):
+            self.run_immediately = False
+            return True, self.schedule.seconds
 
         return self.schedule.is_due(
             self.last_run_at or datetime(MINYEAR, 1, 2, tzinfo=self.schedule.tz)
         )
 
+    def _strtobool(self, v):
+        return v.lower() in ("yes", "true", "t", "1")
 
 class RedBeatScheduler(Scheduler):
     # how often should we sync in schedule information
@@ -425,11 +492,14 @@ class RedBeatScheduler(Scheduler):
                 start=0,
                 num=1,
             )
-            due_tasks, maybe_due = pipe.execute()
+            pipe.smembers("run_immediately")
+            pipe.delete("run_immediately")
+            due_tasks, maybe_due, run_immediately_tasks, _ = pipe.execute()
 
-        logger.debug('beat: Loading %d tasks', len(due_tasks) + len(maybe_due))
+        logger.debug('Loading %d tasks', len(run_immediately_tasks) + len(due_tasks) + len(maybe_due))
+        logger.debug(f'Loading tasks: {list(run_immediately_tasks) + due_tasks + maybe_due}')
         d = {}
-        for key in due_tasks + maybe_due:
+        for key in list(run_immediately_tasks) + due_tasks + maybe_due:
             try:
                 entry = self.Entry.from_key(key, app=self.app)
             except KeyError:
