@@ -253,11 +253,9 @@ class RedBeatSchedulerEntry(ScheduleEntry):
     def get_schedules_by_target(cls, target, app=None):
         ensure_conf(app)
         connection = get_redis(app)
-        schedules_keys = connection.scan(0, f"*{target}*")
-        if not schedules_keys[1]:
-            return []
+        schedules_keys = connection.scan_iter(f"*{target};*")
         schedule_objects = []
-        for key in schedules_keys[1]:
+        for key in schedules_keys:
             connection = get_redis(app)
             schedule_obj = connection.hgetall(key)
             definition = cls.decode_definition(schedule_obj["definition"])
