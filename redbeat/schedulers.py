@@ -270,11 +270,9 @@ class RedBeatSchedulerEntry(ScheduleEntry):
     def get_schedules(cls, app=None):
         ensure_conf(app)
         connection = get_redis(app)
-        schedules_keys = connection.scan(0, f"redbeat:sc4snmp;*")
-        if not schedules_keys[1]:
-            return []
+        schedules_keys = connection.scan_iter(f"redbeat:sc4snmp;*")
         schedule_objects = []
-        for key in schedules_keys[1]:
+        for key in schedules_keys:
             schedule_obj = connection.hgetall(key)
             definition = cls.decode_definition(schedule_obj["definition"])
             meta = cls.decode_definition(schedule_obj["meta"])
