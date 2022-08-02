@@ -523,7 +523,8 @@ class RedBeatScheduler(Scheduler):
     def tick(self, min=min, **kwargs):
         if self.lock:
             logger.debug('beat: Extending lock...')
-            self.lock.extend(int(self.lock_timeout))
+            if self.lock.owned():
+                self.lock.extend(int(self.lock_timeout))
 
         remaining_times = []
         try:
