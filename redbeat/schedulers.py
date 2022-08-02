@@ -523,8 +523,10 @@ class RedBeatScheduler(Scheduler):
     def tick(self, min=min, **kwargs):
         if self.lock:
             logger.debug('beat: Extending lock...')
-            if self.lock.owned():
+            try:
                 self.lock.extend(int(self.lock_timeout))
+            except:
+                logger.debug('Lock error raised on extend')
 
         remaining_times = []
         try:
@@ -540,8 +542,10 @@ class RedBeatScheduler(Scheduler):
     def close(self):
         if self.lock:
             logger.info('beat: Releasing lock')
-            if self.lock.owned() and self.lock.locked():
+            try:
                 self.lock.release()
+            except:
+                logger.debug('Lock error raised on close')
             self.lock = None
         super().close()
 
