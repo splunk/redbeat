@@ -161,7 +161,7 @@ class RedBeatConfig:
         self.key_prefix = self.either_or('redbeat_key_prefix', 'redbeat:')
         self.schedule_key = self.key_prefix + ':schedule'
         self.statics_key = self.key_prefix + ':statics'
-        self.lock_key = self.either_or('redbeat_lock_key', self.key_prefix + ':lock')
+        self.lock_key = None
         self.lock_timeout = self.either_or('redbeat_lock_timeout', None)
         self.redis_url = self.either_or('redbeat_redis_url', app.conf['BROKER_URL'])
         self.redis_use_ssl = self.either_or('redbeat_redis_use_ssl', app.conf['BROKER_USE_SSL'])
@@ -492,8 +492,6 @@ class RedBeatScheduler(Scheduler):
             pipe.delete("run_immediately")
             due_tasks, maybe_due, run_immediately_tasks, _ = pipe.execute()
 
-        logger.debug('Loading %d tasks', len(run_immediately_tasks) + len(due_tasks) + len(maybe_due))
-        logger.debug(f'Loading tasks: {list(run_immediately_tasks) + due_tasks + maybe_due}')
         d = {}
         for key in list(run_immediately_tasks) + due_tasks + maybe_due:
             try:
