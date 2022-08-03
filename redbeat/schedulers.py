@@ -492,8 +492,6 @@ class RedBeatScheduler(Scheduler):
             pipe.delete("run_immediately")
             due_tasks, maybe_due, run_immediately_tasks, _ = pipe.execute()
 
-        logger.debug('Loading %d tasks', len(run_immediately_tasks) + len(due_tasks) + len(maybe_due))
-        logger.debug(f'Loading tasks: {list(run_immediately_tasks) + due_tasks + maybe_due}')
         d = {}
         for key in list(run_immediately_tasks) + due_tasks + maybe_due:
             try:
