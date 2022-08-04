@@ -267,6 +267,14 @@ class RedBeatSchedulerEntry(ScheduleEntry):
         return schedule_objects
 
     @classmethod
+    def delete_schedules_by_target(cls, target, app=None):
+        ensure_conf(app)
+        connection = get_redis(app)
+        schedules_keys = connection.scan_iter(f"*{target};*")
+        for schedule_key in schedules_keys:
+            connection.delete(schedule_key)
+
+    @classmethod
     def get_schedules(cls, app=None):
         ensure_conf(app)
         connection = get_redis(app)
