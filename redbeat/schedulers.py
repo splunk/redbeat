@@ -403,7 +403,7 @@ class RedBeatSchedulerEntry(ScheduleEntry):
     def get_schedules(cls, app=None):
         ensure_conf(app)
         connection = get_redis(app)
-        schedules_keys = connection.scan_iter(f"redbeat:sc4snmp;*")
+        schedules_keys = connection.scan_iter("redbeat:sc4snmp;*")
         schedule_objects = []
         for key in schedules_keys:
             schedule_obj = connection.hgetall(key)
@@ -457,7 +457,7 @@ class RedBeatSchedulerEntry(ScheduleEntry):
             'options': self.options,
             'schedule': self.schedule,
             'enabled': self.enabled,
-            'run_immediately': self.run_immediately
+            'run_immediately': self.run_immediately,
         }
         meta = {
             'last_run_at': self.last_run_at,
@@ -466,7 +466,7 @@ class RedBeatSchedulerEntry(ScheduleEntry):
             pipe.hset(self.key, 'definition', json.dumps(definition, cls=RedBeatJSONEncoder))
             pipe.hsetnx(self.key, 'meta', json.dumps(meta, cls=RedBeatJSONEncoder))
             pipe.zadd(self.app.redbeat_conf.schedule_key, {self.key: self.score})
-            if self.run_immediately:
+            if self._strtobool(self.run_immediately):
                 pipe.sadd("run_immediately", self.key)
             pipe.execute()
 
@@ -519,13 +519,13 @@ class RedBeatSchedulerEntry(ScheduleEntry):
             'schedule': self.schedule,
             'target': self.target,
             'enabled': self.enabled,
-            'run_immediately': self.run_immediately
+            'run_immediately': self.run_immediately,
         }
         with get_redis(self.app).pipeline() as pipe:
             pipe.hset(self.key, 'meta', json.dumps(meta, cls=RedBeatJSONEncoder))
             pipe.hset(self.key, 'definition', json.dumps(definition, cls=RedBeatJSONEncoder))
             pipe.zadd(self.app.redbeat_conf.schedule_key, {self.key: self.score})
-            if self.run_immediately:
+            if self._strtobool(self.run_immediately):
                 pipe.sadd("run_immediately", self.key)
             pipe.execute()
 
@@ -542,7 +542,8 @@ class RedBeatSchedulerEntry(ScheduleEntry):
         )
 
     def _strtobool(self, v):
-        return v.lower() in ("yes", "true", "t", "1")
+        return str(v).lower() in ("yes", "true", "t", "1")
+
 
 class RedBeatScheduler(Scheduler):
     # how often should we sync in schedule information
