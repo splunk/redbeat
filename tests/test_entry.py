@@ -23,7 +23,8 @@ class test_RedBeatEntry(RedBeatCase):
             'args': None,
             'kwargs': CELERY_CONFIG_DEFAULT_KWARGS,
             'options': {},
-            'enabled': True,
+            'enabled': 'True',
+            'run_immediately': 'False',
         }
         expected_key = self.app.redbeat_conf.key_prefix + 'test'
 
