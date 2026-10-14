@@ -1,15 +1,40 @@
+Environment
+-----------
+ - mise is used to pin the Python version (see .mise.toml)
+ - Install mise: https://mise.jdx.dev/getting-started.html
+ - Then activate the environment:
+
+    mise install
+    mise activate
+
 Testing
 ---------
- - use pyenv on OSX to manage multiple python versions for use with tox
- - run ```tox```
+ - Use make for setup and running tests:
 
+    make setup
+    make test
+
+ - Or use pip manually:
+
+    pip install -r requirements-dev.txt
+    pip install -e .
+    python -m unittest discover tests
+
+Linting
+---------
+    make lint
+
+CI
+---------
+ - ci.yml: runs tests across the Python version matrix on push/PR
+ - publish.yml: publishes to PyPI on tagged releases
 
 Release
 ---------
  - bump version and release to pypi
 
-    make version-NEWVERSION
-    make release
+    make release-check
+    VERSION='M.m.p' make release
 
  - create release in GitHub
 
