@@ -1,8 +1,77 @@
+2.4.2 (2026-07-27)
+---------------------
+  - bugfix, restore the pre-2.4.0 handling of options inherited from
+    `broker_transport_options`: they are no longer forwarded to the redis
+    client on `redis://` and `rediss://` URLs, so broker settings such as
+    `visibility_timeout` no longer crash beat at startup. RedBeat's own
+    options (`retry_period`, `cluster`, ...) are never forwarded on any
+    URL type, fixes #319. Options set explicitly via `redbeat_redis_options`
+    still pass through to the client as introduced in 2.4.0. Note this means
+    keys unknown to redis-py in an explicitly set `redbeat_redis_options`
+    now raise a TypeError at startup, where 2.3.3 silently ignored them on
+    `redis://` and `rediss://` URLs.
+  - bugfix, `get_redis` no longer mutates the options dict in place, so the
+    fallback no longer leaks `decode_responses` (and, on cluster URLs, the
+    normalized `startup_nodes`) into `broker_transport_options`
+  - deprecation, falling back to `broker_url` and `broker_transport_options`
+    now emits a DeprecationWarning; RedBeat 2.5.0 will require
+    `redbeat_redis_url` and `redbeat_redis_options` to be set explicitly.
+    The message is also logged at warning level, since DeprecationWarning
+    is silenced by default and beat usually runs as a daemon
+
+2.4.1 (2026-07-16)
+---------------------
+  - ci, restore PyPI/TestPyPI publish jobs dropped in a CI refactor; 2.3.4 and
+    2.4.0 were tagged but never published to PyPI, fixes #316
+  - First PyPI release since 2.3.3; includes all 2.4.0 changes below
+
+2.4.0 (2026-03-26)
+---------------------
+  - Drop support for Python 3.8 and add CI coverage through Python 3.13.
+  - Add support for Redis credential providers, thanks @alaminopu
+  - Use redis-py built-in RedisCluster instead of redis-py-cluster for cluster URLs
+  - Replace deprecated StrictRedis usages with Redis
+  - bugfix, don't wrap Sentinel in RetryingConnection, fixes #309, thanks @victorlane
+
+2.3.3 (2025-07-02)
+---------------------
+  - add Python 3.12 support, thanks @AnkiHubSoftware
+  - bugfix, update RedBeatSchedulerEntry definitions for improved type safety and correctness, thanks @sotosapp
+  - bugfix, Redbeat no longer updating tasks definitions on Redis #289, thanks @semoac
+  - ci, fix testpypi publish by checking out source before version update
+  - test, pin fakeredis<2.27.0 for Python 3.8 support
+
+2.3.0 (2025-02-23)
+---------------------
+  - bugfix, allow disabling of lock with redbeat_lock_key = None, thanks @jscaria, @molog, @bertosantamaria
+  - bugfix, track changes to primary in Sentinel, thanks @Niccolum
+  - bugfix, static entries honour last_run_at, thanks @kchamz
+  - doc updates, thanks @miketheman, @cikay
+
+2.2.0 (2023-12-22)
+--------------------
+  - add ssl support for redis with sentinel, thanks @cyberjunk
+  - add RedisCluster Support, thanks @kkinder
+  - bugfixes
+
+2.1.1 (2023-06-11)
+---------------------
+ - fix compatability with Celery 5.3.0, thanks @jkseppan
+
+2.1.0 (2023-05-17)
+---------------------
+ - BREAKING, drop for support for EOL Python < 3.8
+ - log message cleanup, thanks @joekohlsdorf
+ - ensure lock is owned before releasing, fixing #223, thanks @michaelbukachi
+ - fix #238, #208, failure to aquire lock on startup leads to multiple task executions, thanks @Junzki, @nicklyra, @nigel-gott
+ - Add options support for RedBeatSchedulerEntry, thanks @anton-petrov
+
 2.0.0 (2020-10-25)
 ---------------------
   - BREAKING CHANGES, test with your stack before deploying
     - Drop support for celery<4.2
     - Drop support for pyredis<3
+    - Drop Python 2.7 and 3.5 support, update to 3.6+ syntax, thanks @kleschenko
   - Support timezones other than UTC thanks @luoxiaohei, @sempr and @noamkush
   - Many config handling consistentcy updates
   - Use black linter and drop circle CI in favor of GitHub Actions
@@ -51,3 +120,5 @@
  - be more consistent about using UTC everywhere
  - various bugfixes, thanks Christopher Arndt
  - improved configuration handling, thanks Jannis Leidel
+  -
+  -

@@ -1,3 +1,6 @@
+# OS Files
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -51,6 +54,10 @@ tox-*.xml
 
 # Django stuff:
 *.log
+
+# ide/editor
+.idea/
+.vscode/
 
 # Sphinx documentation
 docs/_build/
