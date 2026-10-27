@@ -22,11 +22,14 @@ jobs:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    env:
+      REDBEAT_TEST_REDIS_SERVER: /usr/bin/redis-server
     strategy:
       fail-fast: false
       max-parallel: 4
       matrix:
-        os: [ubuntu-latest] #, windows-latest] tests fail on windows
+        # Python 3.9 builds are available for Ubuntu 24.04, not 26.04.
+        os: [ubuntu-24.04]
         python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
 
     steps:
@@ -45,8 +48,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Run unittests
-        run: make unittests
+      - name: Install Redis test binary
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes redis-server
+
+      - name: Run unit and isolated Redis tests
+        run: |
+          test -x "$REDBEAT_TEST_REDIS_SERVER"
+          make test
 
   lint:
     name: Lint
