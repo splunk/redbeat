@@ -1,3 +1,30 @@
+Splunk-maintained changes
+------------------------------------
+  These additions are maintained in splunk/redbeat and are recorded separately
+  from the upstream RedBeat release history below.
+
+  - Add RedBeatSchedulerEntry.save_with_first_due() to create an interval
+    entry with an application-selected whole-second UTC first due time.
+    Store its definition, run metadata, due score and policy fingerprint
+    together, without allowing immediate execution to bypass that time.
+  - Add update_definition() to change a managed entry's payload without
+    moving its saved due time or replacing accepted immediate-run state.
+  - Preserve an optional opaque jitter_fingerprint on reload and support
+    first_run_kwargs for the first outgoing managed invocation only.
+    Later reservations continue the ordinary interval schedule.
+  - Guard managed reservations and definition updates against conflicting
+    Redis writes, changed run state and deletion. Preserve newer payloads
+    and immediate requests. Retry WATCH conflicts up to three total attempts.
+    Ordinary managed reservations do not rewrite an unchanged definition.
+  - Add unit and isolated Redis, Beat and worker integration coverage.
+    Run tests with pytest and retain Python 3.9 CI support by using Ubuntu
+    24.04 test runners with an explicitly installed Redis test binary.
+
+  Applications remain responsible for offset calculation and timing policy.
+  This PR does not add a jitter configuration flag, automatic enable/disable
+  transitions or other application lifecycle behavior. Entries without the
+  optional managed state retain their existing scheduling path.
+
 2.4.2 (2026-07-27)
 ---------------------
   - bugfix, restore the pre-2.4.0 handling of options inherited from
