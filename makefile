@@ -58,7 +58,7 @@ docs:
 	$(MAKE) -C docs/ html
 
 unittests:
-	python -m unittest discover tests
+	python -m pytest tests
 
 clean:
 	rm -f dist/*
