@@ -165,7 +165,14 @@ class test_RedBeatScheduler_tick(RedBeatSchedulerTestBase):
 
         with patch.object(self.s, 'send_task') as send_task:
             sleep = self.s.tick()
-            send_task.assert_called_with(e.task, e.args, e.kwargs, **self.s._maybe_due_kwargs)
+            send_task.assert_called_once()
+            args, options = send_task.call_args
+            self.assertEqual(args, (e.task, e.args, e.kwargs))
+            expected_options = dict(self.s._maybe_due_kwargs)
+            # Newer Celery adds a Beat-origin header. Older versions omit it.
+            if 'headers' in options:
+                expected_options['headers'] = {'celery_beat_task': True}
+            self.assertEqual(options, expected_options)
 
         self.assertEqual(sleep, 1.0)
 

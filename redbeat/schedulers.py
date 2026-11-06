@@ -62,7 +62,7 @@ LUA_EXTEND_TO_SCRIPT = """
 REDBEAT_REDIS_KEY = "redbeat_redis"
 REDBEAT_SENTINEL_KEY = "redbeat_sentinel"
 
-# Use three attempts in total for Redis write conflicts or replacement reads.
+# Use three attempts in total for Redis write conflicts.
 # Policy changes are raised separately so the caller can reload the entry.
 _retry_watch_conflicts = retry(
     retry=retry_if_exception_type(redis.exceptions.WatchError),
@@ -1226,13 +1226,7 @@ class RedBeatScheduler(Scheduler):
 
         remaining_times = []
         try:
-            try:
-                entries = self.schedule
-            except redis.exceptions.WatchError:
-                # Repeated replacements prevented a stable read. Retry selection
-                # soon without removing the replacement or publishing an old run.
-                return min(1, self.max_interval)
-            for entry in entries.values():
+            for entry in self.schedule.values():
                 next_time_to_run = self.maybe_due(entry, **self._maybe_due_kwargs)
                 if next_time_to_run:
                     remaining_times.append(next_time_to_run)

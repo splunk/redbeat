@@ -8,7 +8,7 @@ from celery.beat import ScheduleEntry
 from celery.schedules import schedule
 from redis.exceptions import WatchError
 
-from redbeat.schedulers import RedBeatScheduler, RedBeatSchedulerEntry
+from redbeat.schedulers import RedBeatSchedulerEntry
 from tests.test_jitter_concurrent_updates import app as lifecycle_app
 from tests.test_jitter_concurrent_updates import create_entry, load
 from tests.test_jitter_integration import FINGERPRINT, NOW
@@ -434,7 +434,7 @@ def test_creation_identity_adds_no_unknown_fields_for_legacy_constructor(app, ph
     assert legacy.kwargs == entry.kwargs
 
 
-def test_entry_load_uses_existing_hget_pattern_and_checks_creation_identity(app):
+def test_entry_load_uses_existing_hget_pattern_and_preserves_creation_identity(app):
     entry = create_entry(app, kwargs={'payload': 'current'})
     pipeline_class = type(app.redbeat_redis.pipeline())
     original_execute = pipeline_class.execute
@@ -448,7 +448,6 @@ def test_entry_load_uses_existing_hget_pattern_and_checks_creation_identity(app)
         loaded = load(entry)
 
     assert commands == [
-        ('HGET', entry.key, 'entry_id'),
         ('HGET', entry.key, 'definition'),
         ('HGET', entry.key, 'meta'),
         ('HGET', entry.key, 'jitter_fingerprint'),
@@ -508,56 +507,3 @@ def test_disabled_identified_policy_can_consume_an_ordinary_immediate_request(ap
     assert stored.entry_id == entry.entry_id
     assert stored.jitter_fingerprint is None
     assert not stored._strtobool(stored.run_immediately)
-
-
-@pytest.mark.parametrize('repeat', [False, True])
-def test_nontransactional_load_retries_replacement_without_mixing_generations(app, repeat):
-    client = app.redbeat_redis
-    entry = create_entry(app, kwargs={'payload': 'old'})
-    pipeline_class = type(client.pipeline())
-    original_pipeline = client.pipeline
-    original_execute = pipeline_class._execute_pipeline
-    replacements = []
-
-    def pipeline(*args, **kwargs):
-        return original_pipeline(*args, **dict(kwargs, transaction=False))
-
-    def execute(pipe, connection, commands, raise_on_error):
-        commands = list(commands)
-        if not commands or commands[0][0] != ('HGET', entry.key, 'entry_id'):
-            return original_execute(pipe, connection, commands, raise_on_error)
-        results = []
-        for index, (command, options) in enumerate(commands):
-            connection.send_command(*command)
-            results.append(pipe.parse_response(connection, command[0], **options))
-            if index == 1 and (repeat or not replacements):
-                entry.delete()
-                replacements.append(create_entry(app, kwargs={'payload': 'replacement'}))
-        return results
-
-    with patch.object(client, 'pipeline', pipeline), patch.object(
-        pipeline_class, '_execute_pipeline', execute
-    ):
-        if repeat:
-            with pytest.raises(WatchError):
-                load(entry)
-        else:
-            loaded = load(entry)
-            assert loaded.entry_id == replacements[-1].entry_id
-            assert loaded.kwargs == {'payload': 'replacement'}
-
-    assert len(replacements) == (3 if repeat else 1)
-    assert load(entry).entry_id == replacements[-1].entry_id
-
-
-def test_exhausted_load_conflict_defers_tick_without_publication_or_index_removal(app):
-    entry = create_entry(app)
-    scheduler = RedBeatScheduler(app=app, lazy=True, lock_key=None)
-    scheduler.lock_key = None
-    before = saved_state(entry)
-    with patch.object(RedBeatSchedulerEntry, 'from_key', side_effect=WatchError), patch.object(
-        scheduler, 'apply_async'
-    ) as publish:
-        assert scheduler.tick() == min(1, scheduler.max_interval)
-    publish.assert_not_called()
-    assert saved_state(entry) == before

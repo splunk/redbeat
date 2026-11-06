@@ -93,3 +93,10 @@ can therefore be selected before a fractional deadline. The full-precision due
 check still prevents early publication. Beat wake-up frequency, broker latency
 and worker capacity can delay dispatch or execution. Subsecond timing is not a
 real-time execution guarantee.
+
+Entry loading follows the existing pipeline read pattern. Standalone Redis and
+Sentinel use the client's default transactional pipeline. A non-transactional
+read, including a default Cluster pipeline, does not guarantee a consistent
+snapshot if another client deletes and recreates the same key during that read.
+There is no load-time retry or duplicate identity read. Managed writes still
+check the loaded creation identity and applied policy before saving.
