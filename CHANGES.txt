@@ -4,7 +4,8 @@ Splunk-maintained changes
   from the upstream RedBeat release history below.
 
   - Add RedBeatSchedulerEntry.save_with_first_due() to create an interval
-    entry with an application-selected whole-second UTC first due time.
+    entry with an application-selected timezone-aware first due time.
+    Normalize it to UTC while preserving fractional seconds in metadata.
     Store its definition, run metadata, due score and policy fingerprint
     together, without allowing immediate execution to bypass that time.
   - Add update_definition() to change a managed entry's payload without
@@ -16,14 +17,35 @@ Splunk-maintained changes
     Redis writes, changed run state and deletion. Preserve newer payloads
     and immediate requests. Retry WATCH conflicts up to three total attempts.
     Ordinary managed reservations do not rewrite an unchanged definition.
+  - Add the optional redbeat_entry_policy callback to select the following
+    due time and applied policy during reservation. Keep the current stored
+    run unchanged. Allow applications to adopt, replace or remove a policy
+    without adding their timing rules to RedBeat.
+  - Add request_run() for an application-selected managed refresh deadline.
+    Keep the earliest pending deadline and latest payload. Reuse the existing
+    immediate flag and interval metadata rather than a separate request record.
+    Due or overdue requests prompt selection without bypassing the due check.
+  - Add save_guarded() for ordinary entries that may acquire a managed policy.
+    Assign an entry_id on guarded creation and reject stale writes after
+    deletion and recreation under the same key. Keep existing legacy entries
+    without an identity unchanged instead of assigning one during reload.
+  - Store policy fingerprints and creation identities as JSON values so both
+    text and byte Redis responses use the same decoding path.
+  - Keep from_key() on the existing HGET pipeline pattern, without duplicate
+    identity reads or load-time retries. Remove the associated selection-error
+    handler and obsolete tests. Guarded writes retain their identity checks.
+    Non-transactional reads can still mix records during same-key replacement.
   - Add unit and isolated Redis, Beat and worker integration coverage.
+    Cover following-run policies, managed refreshes, same-key replacement,
+    concurrent writes, legacy entries and Redis Cluster managed operations.
     Run tests with pytest and retain Python 3.9 CI support by using Ubuntu
     24.04 test runners with an explicitly installed Redis test binary.
 
   Applications remain responsible for offset calculation and timing policy.
-  This PR does not add a jitter configuration flag, automatic enable/disable
-  transitions or other application lifecycle behavior. Entries without the
-  optional managed state retain their existing scheduling path.
+  RedBeat supplies persistence and the optional following-run policy hook,
+  not a jitter configuration flag or application-specific lifecycle rules.
+  Entries without managed state or a policy requesting adoption retain their
+  existing scheduling path.
 
 2.4.2 (2026-07-27)
 ---------------------
