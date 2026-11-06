@@ -39,11 +39,14 @@ def test_exact_first_due_roundtrip(app, interval, first_delay):
     initial.save_with_first_due(due, FINGERPRINT)
     loaded = RedBeatSchedulerEntry.from_key(initial.key, app)
     raw = app.redbeat_redis.hgetall(initial.key)
-    assert set(raw) == {'definition', 'meta', 'jitter_fingerprint'}
+    assert set(raw) == {'definition', 'meta', 'jitter_fingerprint', 'entry_id'}
     assert app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, initial.key) == to_timestamp(due)
     assert loaded.last_run_at == due - timedelta(seconds=interval)
     assert loaded.total_run_count == 7
     assert loaded.jitter_fingerprint == FINGERPRINT
+    assert json.loads(raw['jitter_fingerprint']) == FINGERPRINT
+    assert json.loads(raw['entry_id']) == loaded.entry_id == initial.entry_id
+    assert 'entry_id' not in json.loads(raw['definition'])
     assert loaded.run_immediately == 'False'
     assert not app.redbeat_redis.sismember('run_immediately', initial.key)
     assert loaded.is_due()[0] is False
@@ -51,6 +54,21 @@ def test_exact_first_due_roundtrip(app, interval, first_delay):
     assert loaded.is_due()[0] is False
     app.now = lambda: due
     assert loaded.is_due()[0] is True
+
+
+@pytest.mark.parametrize('decode_responses', [True, False], ids=['text', 'bytes'])
+def test_json_fingerprint_roundtrip_and_missing_value(app, decode_responses):
+    app.redbeat_redis = FakeRedis(decode_responses=decode_responses)
+    initial = entry(app).save()
+    assert RedBeatSchedulerEntry.from_key(initial.key, app).jitter_fingerprint is None
+    initial.delete()
+
+    fingerprint = 'library-policy-caf\u00e9-\u03bb'
+    initial.save_with_first_due(NOW, fingerprint)
+
+    raw = app.redbeat_redis.hget(initial.key, 'jitter_fingerprint')
+    assert json.loads(raw) == fingerprint
+    assert RedBeatSchedulerEntry.from_key(initial.key, app).jitter_fingerprint == fingerprint
 
 
 def test_writes_are_grouped_in_a_transaction(app):
@@ -66,11 +84,19 @@ def test_writes_are_grouped_in_a_transaction(app):
         entry(app).save_with_first_due(NOW + timedelta(seconds=42), FINGERPRINT)
     transaction, commands = recorded[0]
     assert transaction is True
-    assert [command[0][0] for command in commands] == ['HSET', 'HSET', 'HSET', 'ZADD', 'SREM']
-    assert [command[0][2] for command in commands[:3]] == [
+    assert [command[0][0] for command in commands] == [
+        'HSET',
+        'HSET',
+        'HSET',
+        'HSET',
+        'ZADD',
+        'SREM',
+    ]
+    assert [command[0][2] for command in commands[:4]] == [
         'definition',
         'meta',
         'jitter_fingerprint',
+        'entry_id',
     ]
 
 
@@ -111,7 +137,7 @@ def test_reservation_field_writes_remain_in_one_transaction(app, state):
 def test_ordinary_managed_reservation_does_not_rewrite_definition(app):
     initial = entry(app, kwargs={'value': 'unchanged'}).save_with_first_due(NOW, FINGERPRINT)
     definition = json.loads(app.redbeat_redis.hget(initial.key, 'definition'))
-    # Preserve the exact stored representation, not only equivalent JSON values.
+    # Different whitespace makes an unnecessary definition rewrite visible.
     raw_definition = json.dumps(definition, indent=2)
     app.redbeat_redis.hset(initial.key, 'definition', raw_definition)
 
@@ -140,19 +166,17 @@ def test_reservation_keeps_existing_false_flag_normalization(app):
     'due',
     [
         NOW.replace(tzinfo=None),
-        NOW.replace(microsecond=1),
-        NOW.astimezone(timezone(timedelta(hours=1))),
         None,
     ],
 )
 def test_reject_invalid_due_without_writes(app, due):
     initial = entry(app)
-    with pytest.raises(ValueError, match='UTC'):
+    with pytest.raises(ValueError, match='timezone-aware'):
         initial.save_with_first_due(due, FINGERPRINT)
     assert app.redbeat_redis.dbsize() == 0
 
 
-@pytest.mark.parametrize('interval', [0, -1, 1.5])
+@pytest.mark.parametrize('interval', [0, -1])
 def test_reject_invalid_interval_without_writes(app, interval):
     with pytest.raises(ValueError, match='interval'):
         entry(app, interval).save_with_first_due(NOW, FINGERPRINT)
@@ -196,7 +220,7 @@ def test_first_due_refuses_orphan_hash_instead_of_repairing_it(app):
 def test_definition_only_preserves_due_metadata_and_extra_hash_fields(app):
     initial = entry(
         app,
-        kwargs={'address': 'router-01:161'},
+        kwargs={'job_id': 'job-01'},
         options={'expires': 60, 'link': ['callback']},
     )
     initial.save_with_first_due(
@@ -205,8 +229,9 @@ def test_definition_only_preserves_due_metadata_and_extra_hash_fields(app):
     app.redbeat_redis.hset(initial.key, 'custom_metadata', 'preserve-me')
     before = app.redbeat_redis.hgetall(initial.key)
     score = app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, initial.key)
-    initial.kwargs = {'address': 'router-01:161', 'profile': 'changed'}
-    initial.run_immediately = True  # Definition-only must preserve stored idle state.
+    initial.kwargs = {'job_id': 'job-01', 'revision': 'changed'}
+    # A local flag change must not turn this payload update into a run request.
+    initial.run_immediately = True
     initial.update_definition()
     after = app.redbeat_redis.hgetall(initial.key)
     assert {key: value for key, value in before.items() if key != 'definition'} == {
@@ -214,7 +239,7 @@ def test_definition_only_preserves_due_metadata_and_extra_hash_fields(app):
     }
     assert app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, initial.key) == score
     loaded = RedBeatSchedulerEntry.from_key(initial.key, app)
-    assert loaded.kwargs['profile'] == 'changed'
+    assert loaded.kwargs['revision'] == 'changed'
     assert loaded.first_run_kwargs == {'bootstrap_token': 'first'}
     assert 'bootstrap_token' not in loaded.kwargs
     assert loaded.options == {'expires': 60, 'link': ['callback']}
@@ -238,7 +263,7 @@ def test_definition_update_refuses_missing_or_changed_policy(app, fingerprint):
     if fingerprint is None:
         app.redbeat_redis.hdel(initial.key, 'jitter_fingerprint')
     else:
-        app.redbeat_redis.hset(initial.key, 'jitter_fingerprint', fingerprint)
+        app.redbeat_redis.hset(initial.key, 'jitter_fingerprint', json.dumps(fingerprint))
     before = app.redbeat_redis.hgetall(initial.key)
     score = app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, initial.key)
     initial.kwargs = {'updated': True}
@@ -249,7 +274,7 @@ def test_definition_update_refuses_missing_or_changed_policy(app, fingerprint):
 
 
 def test_reservation_keeps_outgoing_context_only(app):
-    initial = entry(app, kwargs={'address': 'router-01:161'})
+    initial = entry(app, kwargs={'job_id': 'job-01'})
     due = NOW + timedelta(seconds=20)
     initial.save_with_first_due(due, FINGERPRINT, first_run_kwargs={'bootstrap_token': 'first'})
     copied = RedBeatSchedulerEntry(**dict(initial))
@@ -284,8 +309,7 @@ def test_only_update_last_run_preserves_count(app):
 
 def test_managed_reservation_clears_consumed_immediate_request(app):
     initial = entry(app).save_with_first_due(NOW + timedelta(seconds=20), FINGERPRINT)
-    initial.set_run_immediately(True)
-    initial.save()
+    initial.request_run(NOW, run_immediately=True)
     loaded = RedBeatSchedulerEntry.from_key(initial.key, app)
     assert loaded.is_due()[0]
     outgoing = next(loaded)
@@ -396,11 +420,11 @@ def test_first_run_kwargs_can_be_cancelled_before_immediate_run(app):
         NOW + timedelta(seconds=20), FINGERPRINT, first_run_kwargs={'bootstrap_token': 'first'}
     )
     initial.first_run_kwargs = {}
-    initial.run_immediately = True
     initial.save()
     loaded = RedBeatSchedulerEntry.from_key(initial.key, app)
 
     assert loaded.first_run_kwargs == {}
+    loaded.request_run(NOW, run_immediately=True)
     assert next(loaded).kwargs == {}
     assert 'first_run_kwargs' not in json.loads(app.redbeat_redis.hget(initial.key, 'definition'))
 

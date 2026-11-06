@@ -7,8 +7,9 @@
 import json
 import ssl
 import warnings
-from datetime import MINYEAR, datetime, timedelta
+from datetime import MINYEAR, datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 import redis.exceptions
 from celery.app import app_or_default
@@ -60,6 +61,18 @@ LUA_EXTEND_TO_SCRIPT = """
 
 REDBEAT_REDIS_KEY = "redbeat_redis"
 REDBEAT_SENTINEL_KEY = "redbeat_sentinel"
+
+# Use three attempts in total for Redis write conflicts or replacement reads.
+# Policy changes are raised separately so the caller can reload the entry.
+_retry_watch_conflicts = retry(
+    retry=retry_if_exception_type(redis.exceptions.WatchError),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+
+
+class EntryPolicyChanged(ValueError):
+    """The saved schedule has a different applied policy."""
 
 
 class RetryingConnection:
@@ -314,6 +327,7 @@ class RedBeatSchedulerEntry(ScheduleEntry):
         run_immediately=False,
         jitter_fingerprint=None,
         first_run_kwargs=None,
+        entry_id=None,
         **clsargs,
     ):
         super().__init__(
@@ -330,6 +344,7 @@ class RedBeatSchedulerEntry(ScheduleEntry):
         self.target = target
         self.jitter_fingerprint = jitter_fingerprint
         self.first_run_kwargs = dict(first_run_kwargs or {})
+        self.entry_id = entry_id
         ensure_conf(self.app)
 
     @staticmethod
@@ -347,6 +362,10 @@ class RedBeatSchedulerEntry(ScheduleEntry):
     @staticmethod
     def decode_definition(definition):
         return json.loads(definition, cls=RedBeatJSONDecoder)
+
+    @staticmethod
+    def decode_json(value):
+        return json.loads(value) if value else None
 
     @staticmethod
     def load_meta(key, app=None):
@@ -370,7 +389,10 @@ class RedBeatSchedulerEntry(ScheduleEntry):
             pipe.hget(key, 'definition')
             pipe.hget(key, 'meta')
             pipe.hget(key, 'jitter_fingerprint')
-            definition, meta, fingerprint = pipe.execute()
+            pipe.hget(key, 'entry_id')
+            definition, meta, fingerprint, entry_id = pipe.execute()
+        entry_id = cls.decode_json(entry_id)
+        fingerprint = cls.decode_json(fingerprint)
 
         if not definition:
             raise KeyError(key)
@@ -379,7 +401,13 @@ class RedBeatSchedulerEntry(ScheduleEntry):
         meta = cls.decode_meta(meta)
         definition.update(meta)
 
-        entry = cls(app=app, jitter_fingerprint=fingerprint, **definition)
+        # Keep the policy marker and creation identity outside the task definition.
+        entry = cls(
+            app=app,
+            jitter_fingerprint=fingerprint,
+            entry_id=entry_id,
+            **definition,
+        )
         # celery.ScheduleEntry sets last_run_at = utcnow(), which is confusing and wrong
         entry.last_run_at = meta['last_run_at']
 
@@ -491,6 +519,68 @@ class RedBeatSchedulerEntry(ScheduleEntry):
             pipe.delete(self.key)
             pipe.execute()
 
+    def _check_policy(self, fingerprint):
+        # Another writer may have changed the settings after this entry was read.
+        # Ask the caller to reload rather than save using the older settings.
+        if fingerprint != self.jitter_fingerprint:
+            raise EntryPolicyChanged('The applied jitter policy changed')
+
+    def _check_entry(self, entry_id):
+        # Reject an older copy after deletion and creation under the same name.
+        if self.decode_json(entry_id) != self.entry_id:
+            raise KeyError(self.key)
+
+    @_retry_watch_conflicts
+    def save_guarded(self, *, create=False):
+        """
+        Save a loaded ordinary entry without overwriting a new managed policy.
+
+        Like save(), this writes the caller's definition and due score while
+        retaining existing metadata. It also checks the loaded identity and
+        policy before writing, so a caller can reload after a policy change.
+        Creation requires an absent hash and assigns a new identity. Updating
+        a legacy entry without an identity does not add one.
+
+        :param create: Whether to create an absent ordinary entry
+
+        :return: Freshly loaded saved entry
+        :raises KeyError: If the schedule is missing or its creation identity changed
+        :raises ValueError: If the entry is managed or creation finds an existing hash
+        :raises EntryPolicyChanged: If the saved entry acquired another policy
+        """
+        with get_redis(self.app).pipeline(transaction=True) as pipe:
+            pipe.watch(self.key)
+            definition = pipe.hget(self.key, 'definition')
+            fingerprint = self.decode_json(pipe.hget(self.key, 'jitter_fingerprint'))
+            entry_id = pipe.hget(self.key, 'entry_id')
+            if create:
+                if pipe.exists(self.key):
+                    raise ValueError('Cannot replace an existing schedule hash')
+                self.entry_id = str(uuid4())
+            else:
+                if not definition:
+                    raise KeyError(self.key)
+                self._check_entry(entry_id)
+            # Beat may have enabled jitter while this update was being prepared.
+            # Do not overwrite the new timing with the older copy.
+            self._check_policy(fingerprint)
+            if fingerprint:
+                raise ValueError('Managed entries require their guarded update operation')
+            definition = self._jitter_definition()
+            if self.first_run_kwargs:
+                definition['first_run_kwargs'] = dict(self.first_run_kwargs)
+            meta = {'last_run_at': self.last_run_at}
+            pipe.multi()
+            pipe.hset(self.key, 'definition', json.dumps(definition, cls=RedBeatJSONEncoder))
+            pipe.hsetnx(self.key, 'meta', json.dumps(meta, cls=RedBeatJSONEncoder))
+            if create:
+                pipe.hset(self.key, 'entry_id', json.dumps(self.entry_id))
+            pipe.zadd(self.app.redbeat_conf.schedule_key, {self.key: self.score})
+            if self._strtobool(self.run_immediately):
+                pipe.sadd('run_immediately', self.key)
+            pipe.execute()
+        return type(self).from_key(self.key, app=self.app)
+
     def _jitter_definition(self):
         """
         Build the base definition for exact creation and payload updates.
@@ -508,113 +598,220 @@ class RedBeatSchedulerEntry(ScheduleEntry):
             'run_immediately': self.run_immediately,
         }
 
-    def save_with_first_due(self, first_due, fingerprint, *, first_run_kwargs=None):
+    def _validate_due_time(self, due):
         """
-        Create a phased interval entry with its exact first due time.
+        Check an explicit interval deadline and normalize it to UTC.
 
-        Definition, run metadata, due score, and fingerprint are saved together.
-        First-run arguments are supported for these managed interval entries.
-        They override matching recurring kwargs only in the outgoing first
-        invocation. Setting an entry's ``first_run_kwargs`` to an empty dict
-        before saving explicitly cancels pending first-run arguments.
-        An existing entry hash is refused so a competing creator or accepted
-        run cannot be overwritten. Changes to installed schedules use a
-        separate controlled workflow, not this creation operation.
+        These operations represent the deadline as last_run_at plus one interval.
+        Calendar and relative schedules cannot use that calculation. Metadata
+        retains microseconds while the schedule index uses whole seconds.
 
-        :param first_due: Timezone-aware whole-second UTC first due time
-        :param fingerprint: Nonempty identifier for the applied jitter policy
-        :param first_run_kwargs: Optional arguments overlaid on the first outgoing
-            invocation only. Recurring kwargs remain unchanged. A task retry
-            retains these arguments because they are part of its published message.
+        :param due: Requested timezone-aware datetime
 
-        :return: This entry with its initial run metadata set
-        :raises ValueError: If timing or fingerprint is invalid, or the entry exists
+        :return: The same instant in UTC, retaining microseconds
+        :raises ValueError: If the interval or due time is unsupported
         """
         interval = getattr(self.schedule, 'run_every', None)
         if (
             not isinstance(interval, timedelta)
             or interval <= timedelta(0)
-            or interval.microseconds
             or getattr(self.schedule, 'relative', False)
         ):
-            raise ValueError('Phasing requires a positive whole-second interval')
-        if (
-            not isinstance(first_due, datetime)
-            or first_due.utcoffset() != timedelta(0)
-            or first_due.microsecond
-        ):
-            raise ValueError('First due must be a whole-second UTC timestamp')
+            raise ValueError('Explicit timing requires a positive non-relative interval')
+        if not isinstance(due, datetime) or due.utcoffset() is None:
+            raise ValueError('Due time must be a timezone-aware datetime')
+        # Subtract intervals in UTC so a local daylight-saving change cannot
+        # move the requested instant. The existing encoder keeps microseconds.
+        return due.astimezone(timezone.utc)
 
-        if not isinstance(fingerprint, str) or not fingerprint:
-            raise ValueError('A jitter fingerprint is required')
+    def save_with_first_due(self, first_due, fingerprint, *, first_run_kwargs=None):
+        """
+        Create a phased interval entry with its exact first due time.
 
-        last_run_at = first_due - interval
-        definition = self._jitter_definition()
+        Definition, run metadata, due score, and fingerprint are saved together.
+        First-run arguments override matching recurring kwargs in the first
+        outgoing invocation. An existing hash is refused so creation cannot
+        overwrite another entry or a previously accepted run. Use request_run()
+        to change an existing managed entry's deadline.
+
+        :param first_due: Timezone-aware first due time, normalized to UTC
+        :param fingerprint: Nonempty identifier for the application's scheduling policy
+        :param first_run_kwargs: Arguments overlaid on the first outgoing invocation.
+            None uses this entry's pending arguments. An empty dict omits them.
+            Recurring kwargs remain unchanged. The published message contains the
+            overlaid arguments, so a task retry can reuse them.
+
+        :return: This entry with its initial run metadata set
+        :raises ValueError: If timing or fingerprint is invalid, or the entry exists
+        """
         first_run_kwargs = dict(
             self.first_run_kwargs if first_run_kwargs is None else first_run_kwargs
         )
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise ValueError('A jitter fingerprint is required')
+        first_due = self._validate_due_time(first_due)
+        definition = self._jitter_definition()
+        # Guarded writes compare this identity to reject older copies after
+        # recreation, even when the name, timing and payload are unchanged.
+        entry_id = str(uuid4())
         if first_run_kwargs:
             definition['first_run_kwargs'] = first_run_kwargs
         definition['run_immediately'] = 'False'
-        meta = {'last_run_at': last_run_at, 'total_run_count': self.total_run_count}
-
-        with get_redis(self.app).pipeline() as pipe:
+        # For a 60s interval due at 12:01:20, save last_run_at as 12:00:20.
+        # This produces the chosen due without recording an actual execution.
+        meta = {
+            'last_run_at': first_due - self.schedule.run_every,
+            'total_run_count': self.total_run_count,
+        }
+        with get_redis(self.app).pipeline(transaction=True) as pipe:
             pipe.watch(self.key)
             if pipe.exists(self.key):
                 raise ValueError('Cannot replace an existing schedule hash')
+            # Save the chosen first time and matching run information together.
+            # Ordinary save() can calculate a different first time.
             pipe.multi()
             pipe.hset(self.key, 'definition', json.dumps(definition, cls=RedBeatJSONEncoder))
             pipe.hset(self.key, 'meta', json.dumps(meta, cls=RedBeatJSONEncoder))
-            pipe.hset(self.key, 'jitter_fingerprint', fingerprint)
+            pipe.hset(self.key, 'jitter_fingerprint', json.dumps(fingerprint))
+            pipe.hset(self.key, 'entry_id', json.dumps(entry_id))
             pipe.zadd(self.app.redbeat_conf.schedule_key, {self.key: to_timestamp(first_due)})
+            # Wait for the chosen first time instead of running immediately.
             pipe.srem('run_immediately', self.key)
             pipe.execute()
-        self.last_run_at = last_run_at
+        self.last_run_at = first_due - self.schedule.run_every
         self.run_immediately = 'False'
         self.jitter_fingerprint = fingerprint
         self.first_run_kwargs = first_run_kwargs
+        self.entry_id = entry_id
         return self
 
-    @retry(
-        retry=retry_if_exception_type(redis.exceptions.WatchError),
-        stop=stop_after_attempt(3),
-        reraise=True,
-    )
+    @_retry_watch_conflicts
+    def request_run(self, due, *, run_immediately=False, fingerprint=None):
+        """
+        Request a managed run using the earliest pending request deadline.
+
+        Repeated delayed requests keep the earliest due and latest payload.
+        To request an urgent run, pass the current time as due. A later request
+        cannot postpone it, though the latest request still supplies the payload.
+        The existing immediate flag marks an accepted managed request. Its
+        interval anchor stores the deadline, which is checked before dispatch.
+        This temporary anchor is not an actual reservation timestamp. The run
+        count is preserved.
+        First-invocation arguments are cleared because this is a refresh.
+        Identical deadlines and payloads may coalesce into one invocation.
+        Redis write conflicts allow three total attempts, at most two retries.
+
+        :param due: Timezone-aware requested due time, normalized to UTC
+        :param run_immediately: Whether to prompt immediate selection even for a
+            future deadline. Due or overdue requests always prompt selection.
+            This flag does not bypass the due-time check.
+        :param fingerprint: Applied policy after an intentional interval change
+
+        :return: This entry with its accepted deadline and updated definition
+        :raises KeyError: If the schedule is missing or its creation identity changed
+        :raises ValueError: If timing, interval or applied policy is invalid
+        """
+        due = self._validate_due_time(due)
+        run_immediately = self._strtobool(run_immediately)
+        applied_fingerprint = self.jitter_fingerprint if fingerprint is None else fingerprint
+        if not isinstance(applied_fingerprint, str) or not applied_fingerprint:
+            raise ValueError('A jitter fingerprint is required')
+
+        with get_redis(self.app).pipeline(transaction=True) as pipe:
+            pipe.watch(self.key)
+            raw_definition = pipe.hget(self.key, 'definition')
+            current_fingerprint = self.decode_json(pipe.hget(self.key, 'jitter_fingerprint'))
+            raw_meta = pipe.hget(self.key, 'meta')
+            entry_id = pipe.hget(self.key, 'entry_id')
+            if not raw_definition:
+                raise KeyError(self.key)
+            current = self.decode_definition(raw_definition)
+            self._check_entry(entry_id)
+            self._check_policy(current_fingerprint)
+            if fingerprint is None and current['schedule'] != self.schedule:
+                raise ValueError('Changing a request interval requires its applied policy')
+            if not current_fingerprint:
+                raise ValueError('A managed update requires an applied jitter policy')
+
+            current_meta = self.decode_meta(raw_meta)
+            if self._strtobool(current.get('run_immediately', 'False')):
+                # If a refresh is already waiting, a later request must not delay it.
+                # Read its due using the old interval before applying an interval edit.
+                accepted_due = current_meta['last_run_at'] + current['schedule'].run_every
+                due = min(due, accepted_due)
+            definition = self._jitter_definition()
+            # Mark this as a requested run and save when it should happen below.
+            # Reuse the existing fields rather than create a separate request record.
+            definition['run_immediately'] = 'True'
+            meta = {
+                'last_run_at': due - self.schedule.run_every,
+                'total_run_count': current_meta.get('total_run_count', 0),
+            }
+            pipe.multi()
+            pipe.hset(self.key, 'definition', json.dumps(definition, cls=RedBeatJSONEncoder))
+            pipe.hset(self.key, 'meta', json.dumps(meta, cls=RedBeatJSONEncoder))
+            if applied_fingerprint != current_fingerprint:
+                pipe.hset(self.key, 'jitter_fingerprint', json.dumps(applied_fingerprint))
+            pipe.zadd(self.app.redbeat_conf.schedule_key, {self.key: to_timestamp(due)})
+            # Prompt selection for urgent or overdue requests. Every request
+            # also retains its deadline in the schedule index for later selection.
+            if run_immediately or due <= self._default_now():
+                pipe.sadd('run_immediately', self.key)
+            else:
+                pipe.srem('run_immediately', self.key)
+            pipe.execute()
+        self.run_immediately = definition['run_immediately']
+        self.first_run_kwargs = {}
+        self.jitter_fingerprint = applied_fingerprint
+        self.last_run_at = meta['last_run_at']
+        self.total_run_count = meta['total_run_count']
+        return self
+
+    @_retry_watch_conflicts
     def update_definition(self):
         """
         Update a managed entry's payload without changing its saved timing.
 
         The immediate flag and pending first-invocation arguments remain as stored.
-        Metadata, fingerprint, pending request, due score, and immediate-set
-        membership are untouched. This operation does not request a run.
+        Metadata, fingerprint, due score, and immediate-set membership are
+        untouched. This operation does not request a run. A definition that
+        serializes identically to the stored JSON does not need another write.
         Redis write conflicts allow three total attempts, at most two retries.
 
         :return: This entry after saving the updated definition
-        :raises KeyError: If the schedule no longer exists
+        :raises KeyError: If the schedule is missing or its creation identity changed
         :raises ValueError: If the interval or applied policy is incompatible
         """
-        with get_redis(self.app).pipeline() as pipe:
+        with get_redis(self.app).pipeline(transaction=True) as pipe:
             pipe.watch(self.key)
-            raw_definition, fingerprint = pipe.hmget(self.key, 'definition', 'jitter_fingerprint')
+            raw_definition = pipe.hget(self.key, 'definition')
+            fingerprint = self.decode_json(pipe.hget(self.key, 'jitter_fingerprint'))
+            entry_id = pipe.hget(self.key, 'entry_id')
             if not raw_definition:
                 raise KeyError(self.key)
 
             current = self.decode_definition(raw_definition)
 
-            if not fingerprint or fingerprint != self.jitter_fingerprint:
-                raise ValueError('The applied jitter policy changed')
+            self._check_entry(entry_id)
+            self._check_policy(fingerprint)
             if current['schedule'] != self.schedule:
                 raise ValueError('A definition-only update cannot change the interval')
-
-            definition = self._jitter_definition()
-            definition['run_immediately'] = current.get('run_immediately', 'False')
+            if not fingerprint:
+                raise ValueError('A managed update requires an applied jitter policy')
 
             first_run_kwargs = current.get('first_run_kwargs', {})
+            definition = self._jitter_definition()
+            # A refresh may have been requested while this update was prepared.
+            # Keep that request and any arguments still waiting for their first run.
             if first_run_kwargs:
-                definition['first_run_kwargs'] = first_run_kwargs
-            pipe.multi()
-            pipe.hset(self.key, 'definition', json.dumps(definition, cls=RedBeatJSONEncoder))
-            pipe.execute()
+                definition['first_run_kwargs'] = dict(first_run_kwargs)
+            definition['run_immediately'] = current.get('run_immediately', 'False')
+            encoded_definition = json.dumps(definition, cls=RedBeatJSONEncoder)
+            # Compare JSON text so byte responses work and argument type changes are kept.
+            if encoded_definition != json.dumps(json.loads(raw_definition)):
+                pipe.multi()
+                pipe.hset(self.key, 'definition', encoded_definition)
+                pipe.execute()
         self.kwargs = definition['kwargs']
         self.run_immediately = definition['run_immediately']
         self.first_run_kwargs = dict(first_run_kwargs)
@@ -628,6 +825,22 @@ class RedBeatSchedulerEntry(ScheduleEntry):
         self.run_immediately = run_immediately
 
     def _next_instance(self, last_run_at=None, only_update_last_run_at=False):
+        """
+        Reserve one invocation without changing the stored recurring arguments.
+
+        Entries with a policy marker or creation identity use guarded writes.
+        These reject changes to the loaded policy or run state and check pending
+        request payloads. An optional application policy selects the following
+        deadline and policy marker. Its proposal is stored with this reservation.
+        Unmarked entries without a proposal keep their existing write path.
+
+        :param last_run_at: Reservation timestamp, or the application's current time
+        :param only_update_last_run_at: Whether to retain the previous run count
+
+        :return: Outgoing entry, with first-run arguments overlaid for guarded entries
+        :raises KeyError: If a guarded entry is missing or its creation identity changed
+        :raises ValueError: If compared guarded state changed before reservation
+        """
         entry = super()._next_instance(last_run_at=last_run_at)
 
         if only_update_last_run_at:
@@ -638,16 +851,24 @@ class RedBeatSchedulerEntry(ScheduleEntry):
             'last_run_at': entry.last_run_at,
             'total_run_count': entry.total_run_count,
         }
+        policy = None if only_update_last_run_at else self.app.conf.get('redbeat_entry_policy')
 
-        # The outgoing invocation keeps its own kwargs for publication and retries.
-        if self.jitter_fingerprint:
+        # Copy kwargs so the first-run overlay leaves the recurring dict unchanged.
+        if self.jitter_fingerprint or self.entry_id:
             entry.kwargs = dict(entry.kwargs)
             entry.kwargs.update(self.first_run_kwargs)
             entry.first_run_kwargs = {}
             entry.run_immediately = 'False'
-            self._save_phased_reservation(entry, meta)
+            self._save_phased_reservation(entry, meta, policy=policy)
             return entry
 
+        # Preview policy adoption for an unmarked entry. A proposal changes the
+        # following run while this invocation keeps its already-selected timing.
+        if policy and self._following_timing(entry, policy) is not None:
+            if self._save_phased_reservation(entry, meta, policy=policy):
+                return entry
+
+        # If no special timing update applies, save the next run as before.
         with get_redis(self.app).pipeline() as pipe:
             pipe.hset(self.key, 'meta', json.dumps(meta, cls=RedBeatJSONEncoder))
             pipe.zadd(self.app.redbeat_conf.schedule_key, {entry.key: entry.score})
@@ -657,74 +878,176 @@ class RedBeatSchedulerEntry(ScheduleEntry):
 
     __next__ = next = _next_instance
 
-    @retry(
-        retry=retry_if_exception_type(redis.exceptions.WatchError),
-        stop=stop_after_attempt(3),
-        reraise=True,
-    )
-    def _save_phased_reservation(self, entry, meta):
+    def _following_timing(self, entry, policy):
+        """
+        Ask the application for the next run's optional deadline and policy marker.
+
+        None keeps ordinary recurrence. A pair selects an exact following due
+        and fingerprint. A None due changes only the fingerprint, and a None
+        fingerprint removes the applied policy. An exception or invalid proposal
+        is ignored, so the reservation uses ordinary recurrence. Unmarked entries
+        preview the policy before the guarded read. The callback must not change
+        scheduling state because it runs again under WATCH and may repeat after
+        a Redis write conflict.
+
+        :param entry: Recurring definition with the prospective reservation time
+        :param policy: Application callback that does not change scheduling state
+
+        :return: Validated due and fingerprint pair, or None
+        """
+        try:
+            proposal = policy(entry)
+            if proposal is None:
+                return None
+            due, fingerprint = proposal
+            if due is not None:
+                due = self._validate_due_time(due)
+                if due <= entry.last_run_at:
+                    raise ValueError('The following due must be after its reservation')
+            if fingerprint is not None and (not isinstance(fingerprint, str) or not fingerprint):
+                raise ValueError('A nonempty policy fingerprint is required')
+            return due, fingerprint
+        except Exception:
+            logger.exception('beat: Following-run policy failed for %s', self.name)
+            return None
+
+    @_retry_watch_conflicts
+    def _save_phased_reservation(self, entry, meta, *, policy=None):
         """
         Save a phased reservation without replacing a newer task definition.
 
         Read the latest payload before clearing consumed first-run state. An
-        unchanged definition is left untouched. A newer immediate request
-        keeps its flag, queue membership and due score.
+        unchanged definition is left untouched. A changed requested deadline
+        or payload rejects this stale reservation so a later selection can use
+        the newer request. Identical requests may coalesce.
         Redis write conflicts allow three total attempts, at most two retries,
         rereading the saved state each time.
         Deleted entries are not recreated. Changed policy, interval and run
-        metadata are rejected. A reused key with matching state cannot be
-        distinguished from the previously loaded entry.
+        metadata are rejected. A stored creation identity also rejects a
+        replacement under the same name, even when its other fields match.
 
-        :param entry: Outgoing invocation with its next run metadata
+        :param entry: Outgoing entry with this reservation's metadata
         :param meta: Run metadata to store for this reservation
+        :param policy: Optional pure callback proposing the next deadline and policy
 
-        :return: None
-        :raises KeyError: If the schedule was deleted
+        :return: Whether a guarded reservation was stored
+        :raises KeyError: If the schedule is missing or its creation identity changed
         :raises ValueError: If policy, interval, or run state is incompatible
         :raises redis.exceptions.WatchError: If concurrent writes prevent saving
         """
-        with get_redis(self.app).pipeline() as pipe:
+        with get_redis(self.app).pipeline(transaction=True) as pipe:
             pipe.watch(self.key)
-            raw_definition, fingerprint, raw_meta = pipe.hmget(
-                self.key, 'definition', 'jitter_fingerprint', 'meta'
-            )
+            raw_definition = pipe.hget(self.key, 'definition')
+            fingerprint = self.decode_json(pipe.hget(self.key, 'jitter_fingerprint'))
+            raw_meta = pipe.hget(self.key, 'meta')
+            entry_id = pipe.hget(self.key, 'entry_id')
             if not raw_definition:
                 raise KeyError(self.key)
 
+            # Another writer may have updated the task while Beat prepared this run.
+            # Keep its newer task arguments instead of saving Beat's older copy.
             definition = self.decode_definition(raw_definition)
-            if fingerprint != self.jitter_fingerprint:
-                raise ValueError('The applied jitter policy changed')
-            if definition['schedule'] != self.schedule:
-                raise ValueError('The schedule interval changed before reservation')
+            self._check_entry(entry_id)
+            self._check_policy(fingerprint)
+            if definition['schedule'] != self.schedule or definition['task'] != self.task:
+                raise ValueError('The schedule task or interval changed before reservation')
 
             current_meta = self.decode_meta(raw_meta)
+            # Another reservation or refresh may have changed this run's timing.
+            # Do not save this older selection over the newer run information.
             if (
                 current_meta.get('last_run_at') != self.last_run_at
                 or current_meta.get('total_run_count', 0) != self.total_run_count
             ):
                 raise ValueError('The schedule run state changed before reservation')
 
-            new_immediate_request = not self._strtobool(self.run_immediately) and self._strtobool(
+            if (
+                not fingerprint
+                and not self.entry_id
+                and pipe.sismember('run_immediately', self.key)
+            ):
+                # An ordinary immediate request is still pending. Let the ordinary
+                # reservation path handle it before applying a following-run policy.
+                return False
+
+            if (fingerprint or self.entry_id) and self._strtobool(
                 definition.get('run_immediately', 'False')
-            )
+            ):
+                # A newer refresh may carry different arguments from this selection.
+                # Compare both copies in the same saved format before accepting it.
+                requested_definition = self._jitter_definition()
+                if self.first_run_kwargs:
+                    requested_definition['first_run_kwargs'] = self.first_run_kwargs
+                requested_definition = self.decode_definition(
+                    json.dumps(requested_definition, cls=RedBeatJSONEncoder)
+                )
+                current_request = dict(definition)
+                # reschedule() saves target, while ordinary save() omits it.
+                # Compare it when the stored request includes that field.
+                if 'target' in current_request:
+                    requested_definition['target'] = self.target
+                if not fingerprint:
+                    # Ordinary is_due() clears its local immediate flag. The
+                    # saved request still belongs to this run when its payload
+                    # and run information match.
+                    requested_definition['run_immediately'] = current_request['run_immediately']
+                for flag in ('enabled', 'run_immediately'):
+                    requested_definition[flag] = self._strtobool(requested_definition.get(flag))
+                    current_request[flag] = self._strtobool(current_request.get(flag))
+                if current_request != requested_definition:
+                    raise ValueError('The requested payload changed before reservation')
+            # Remove the first-run arguments used by this run. If another writer
+            # saved different first-run arguments, leave them for their own run.
             definition_changed = False
             if self.first_run_kwargs and (
                 definition.get('first_run_kwargs') == self.first_run_kwargs
             ):
                 definition.pop('first_run_kwargs')
                 definition_changed = True
-            if not new_immediate_request and definition.get('run_immediately') != 'False':
+            if definition.get('run_immediately') != 'False':
                 definition['run_immediately'] = 'False'
                 definition_changed = True
 
+            proposal = None
+            if policy and not definition.get('first_run_kwargs'):
+                # Defer policy changes while newer first-run arguments remain.
+                # Once consumed, the policy can choose the following deadline.
+                following = type(self)(
+                    app=self.app,
+                    jitter_fingerprint=fingerprint,
+                    entry_id=self.entry_id,
+                    **definition,
+                    **meta,
+                )
+                proposal = self._following_timing(following, policy)
+            if not fingerprint and not self.entry_id and proposal is None:
+                return False
+            stored_meta = meta
+            next_score = entry.score
+            next_fingerprint = fingerprint
+            if proposal is not None:
+                due, next_fingerprint = proposal
+                if due is not None:
+                    # Keep the precise deadline in the interval anchor. Beat's
+                    # whole-second index may select it before is_due() allows a run.
+                    stored_meta = dict(meta, last_run_at=due - self.schedule.run_every)
+                    next_score = to_timestamp(due)
+
             pipe.multi()
-            pipe.hset(self.key, 'meta', json.dumps(meta, cls=RedBeatJSONEncoder))
+            pipe.hset(self.key, 'meta', json.dumps(stored_meta, cls=RedBeatJSONEncoder))
+            # Rewrite the definition only when consuming first-run arguments or
+            # normalizing the immediate flag, so ordinary runs avoid this write.
             if definition_changed:
                 pipe.hset(self.key, 'definition', json.dumps(definition, cls=RedBeatJSONEncoder))
-            if not new_immediate_request:
-                pipe.zadd(self.app.redbeat_conf.schedule_key, {entry.key: entry.score})
-                pipe.srem('run_immediately', self.key)
+            if next_fingerprint != fingerprint:
+                if next_fingerprint is None:
+                    pipe.hdel(self.key, 'jitter_fingerprint')
+                else:
+                    pipe.hset(self.key, 'jitter_fingerprint', json.dumps(next_fingerprint))
+            pipe.zadd(self.app.redbeat_conf.schedule_key, {entry.key: next_score})
+            pipe.srem('run_immediately', self.key)
             pipe.execute()
+        return True
 
     def reschedule(self, last_run_at=None):
         self.last_run_at = last_run_at or self._default_now()
@@ -756,10 +1079,18 @@ class RedBeatSchedulerEntry(ScheduleEntry):
         if not self._strtobool(self.enabled):
             return False, 5.0  # 5 second delay for re-enable.
 
+        if self.jitter_fingerprint and self._strtobool(self.run_immediately):
+            # Managed requests use run_immediately as a pending-request marker,
+            # including refreshes with a future deadline. Lookahead can select
+            # them early, so check the saved deadline before allowing dispatch.
+            # Urgent requests with a due-now deadline pass this check immediately.
+            remaining = (
+                self.last_run_at + self.schedule.run_every - self._default_now()
+            ).total_seconds()
+            return remaining <= 0, remaining if remaining > 0 else self.schedule.seconds
+
         if self._strtobool(self.run_immediately):
-            # Phased reservation needs the loaded flag to recognize newer requests.
-            if not self.jitter_fingerprint:
-                self.run_immediately = False
+            self.run_immediately = False
             return True, self.schedule.seconds
 
         return self.schedule.is_due(
@@ -895,7 +1226,13 @@ class RedBeatScheduler(Scheduler):
 
         remaining_times = []
         try:
-            for entry in self.schedule.values():
+            try:
+                entries = self.schedule
+            except redis.exceptions.WatchError:
+                # Repeated replacements prevented a stable read. Retry selection
+                # soon without removing the replacement or publishing an old run.
+                return min(1, self.max_interval)
+            for entry in entries.values():
                 next_time_to_run = self.maybe_due(entry, **self._maybe_due_kwargs)
                 if next_time_to_run:
                     remaining_times.append(next_time_to_run)
