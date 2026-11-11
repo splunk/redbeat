@@ -6,9 +6,9 @@ from uuid import UUID
 import pytest
 from celery.beat import ScheduleEntry
 from celery.schedules import schedule
-from redis.exceptions import WatchError
+from redis.exceptions import ConnectionError, WatchError
 
-from redbeat.schedulers import RedBeatSchedulerEntry
+from redbeat.schedulers import EntryAlreadyExists, RedBeatSchedulerEntry
 from tests.test_jitter_concurrent_updates import app as lifecycle_app
 from tests.test_jitter_concurrent_updates import create_entry, load
 from tests.test_jitter_integration import FINGERPRINT, NOW
@@ -313,16 +313,87 @@ def test_guarded_ordinary_replacement_rejects_stale_writes(app, operation):
 
 
 @pytest.mark.parametrize('identified', [False, True])
-def test_guarded_creation_refuses_existing_definition_or_orphan_hash(app, identified):
+@pytest.mark.parametrize('phased', [False, True])
+def test_guarded_creation_refuses_existing_definition_or_orphan_hash(app, identified, phased):
     entry = RedBeatSchedulerEntry('ordinary-entry', 'tasks.test', schedule(60, app=app), app=app)
     if identified:
         entry.save_guarded(create=True)
     else:
         app.redbeat_redis.hset(entry.key, 'meta', '{}')
     before = saved_state(entry)
-    with pytest.raises(ValueError, match='existing schedule hash'):
-        entry.save_guarded(create=True)
+    identity = entry.entry_id
+    with pytest.raises(EntryAlreadyExists, match='existing schedule hash'):
+        if phased:
+            entry.save_with_first_due(NOW, FINGERPRINT)
+        else:
+            entry.save_guarded(create=True)
     assert saved_state(entry) == before
+    assert entry.entry_id == identity
+
+
+@pytest.mark.parametrize('phased', [False, True])
+@pytest.mark.parametrize(
+    'failure,conflicts', [(WatchError, 1), (WatchError, 3), (ConnectionError, 1)]
+)
+def test_creation_assigns_identity_only_after_successful_commit(app, phased, failure, conflicts):
+    entry = RedBeatSchedulerEntry('ordinary-entry', 'tasks.test', schedule(60, app=app), app=app)
+    pipeline_class = type(app.redbeat_redis.pipeline())
+    execute = pipeline_class.execute
+    attempts = []
+
+    def commit(pipe, *args, **kwargs):
+        if any(command[0][0] == 'ZADD' for command in pipe.command_stack):
+            assert entry.entry_id is None
+            attempts.append(True)
+            if len(attempts) <= conflicts:
+                raise failure('creation did not commit')
+        return execute(pipe, *args, **kwargs)
+
+    def create():
+        if phased:
+            return entry.save_with_first_due(NOW, FINGERPRINT)
+        return entry.save_guarded(create=True)
+
+    with patch.object(pipeline_class, 'execute', commit):
+        if failure is WatchError and conflicts == 1:
+            stored = create()
+            assert entry.entry_id == stored.entry_id == load(entry).entry_id
+            assert UUID(entry.entry_id).version == 4
+        else:
+            with pytest.raises(failure):
+                create()
+            assert entry.entry_id is None
+            assert saved_state(entry) == ({}, None, False)
+    assert len(attempts) == (min(conflicts + 1, 3) if failure is WatchError else 1)
+
+
+@pytest.mark.parametrize('phased', [False, True])
+def test_creation_conflict_preserves_the_winner_and_losing_callers_identity(app, phased):
+    entry = RedBeatSchedulerEntry('ordinary-entry', 'tasks.test', schedule(60, app=app), app=app)
+    pipeline_class = type(app.redbeat_redis.pipeline())
+    execute = pipeline_class.execute
+    winner = []
+    winner_state = []
+
+    def commit(pipe, *args, **kwargs):
+        if not winner and any(command[0][0] == 'ZADD' for command in pipe.command_stack):
+            replacement = RedBeatSchedulerEntry(
+                entry.name, entry.task, entry.schedule, app=app, kwargs={'payload': 'winner'}
+            )
+            winner.append(replacement)
+            replacement.save_guarded(create=True)
+            winner_state.append(saved_state(replacement))
+        return execute(pipe, *args, **kwargs)
+
+    with patch.object(pipeline_class, 'execute', commit):
+        with pytest.raises(EntryAlreadyExists):
+            if phased:
+                entry.save_with_first_due(NOW, FINGERPRINT)
+            else:
+                entry.save_guarded(create=True)
+    assert entry.entry_id is None
+    assert saved_state(entry) == winner_state[0]
+    assert load(entry).entry_id == winner[0].entry_id
 
 
 @pytest.mark.parametrize('operation', ['save', 'reservation'])
@@ -363,6 +434,7 @@ def test_legacy_managed_copy_rejects_identified_replacement(app, operation):
 def test_identity_survives_existing_definition_writers(app, serializer):
     entry = create_entry(app)
     identity = entry.entry_id
+    fingerprint = entry.jitter_fingerprint
     if serializer == 'save':
         entry.save()
     elif serializer == 'reschedule':
@@ -373,6 +445,7 @@ def test_identity_survives_existing_definition_writers(app, serializer):
     else:
         assert next(entry).entry_id == identity
     assert load(entry).entry_id == identity
+    assert load(entry).jitter_fingerprint == fingerprint
     assert 'entry_id' not in load(entry).kwargs
     assert 'entry_id' not in json.loads(app.redbeat_redis.hget(entry.key, 'definition'))
     assert json.loads(app.redbeat_redis.hget(entry.key, 'entry_id')) == identity

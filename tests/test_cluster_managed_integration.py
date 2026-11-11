@@ -17,7 +17,12 @@ from redis import Redis
 from redis.exceptions import ConnectionError
 
 from redbeat.decoder import RedBeatJSONEncoder, to_timestamp
-from redbeat.schedulers import RedBeatScheduler, RedBeatSchedulerEntry, RetryingConnection
+from redbeat.schedulers import (
+    EntryAlreadyExists,
+    RedBeatScheduler,
+    RedBeatSchedulerEntry,
+    RetryingConnection,
+)
 
 NOW = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
 POLICY = 'library-policy-one'
@@ -197,6 +202,21 @@ def stored_state(entry):
     )
 
 
+@pytest.mark.parametrize('writer', ['save', 'reschedule'])
+def test_cluster_legacy_immediate_write_replaces_managed_timing(cluster_app, writer):
+    entry = create_entry(cluster_app, NOW + timedelta(seconds=20))
+    identity = entry.entry_id
+    entry.run_immediately = True
+    getattr(entry, writer)()
+    stored = load(entry)
+    assert stored.jitter_fingerprint is None
+    assert stored.entry_id == identity
+    assert stored.is_due()[0]
+    next(stored)
+    assert load(entry).last_run_at == NOW
+    assert load(entry).total_run_count == 1
+
+
 def test_cluster_managed_creation_payload_refresh_and_reservation(cluster_app):
     app = cluster_app
     due = NOW + timedelta(seconds=20)
@@ -249,6 +269,36 @@ def test_cluster_guarded_ordinary_update(cluster_app):
     updated = entry.save_guarded()
     assert updated.kwargs == {'updated': True}
     assert updated.jitter_fingerprint is None
+
+
+@pytest.mark.parametrize('phased', [False, True])
+def test_cluster_creation_conflict_preserves_winner_and_unset_caller_identity(cluster_app, phased):
+    app = cluster_app
+    entry = RedBeatSchedulerEntry('creation-race', 'tasks.example', schedule(60, app=app), app=app)
+    pipeline_class = type(app.redbeat_redis.pipeline(transaction=True))
+    execute = pipeline_class.execute
+    winner = []
+    winner_state = []
+
+    def commit(pipe, *args, **kwargs):
+        if not winner:
+            replacement = RedBeatSchedulerEntry(
+                entry.name, entry.task, entry.schedule, app=app, kwargs={'payload': 'winner'}
+            )
+            winner.append(replacement)
+            replacement.save_guarded(create=True)
+            winner_state.append(stored_state(replacement))
+        return execute(pipe, *args, **kwargs)
+
+    with patch.object(pipeline_class, 'execute', commit):
+        with pytest.raises(EntryAlreadyExists):
+            if phased:
+                entry.save_with_first_due(NOW, POLICY)
+            else:
+                entry.save_guarded(create=True)
+    assert entry.entry_id is None
+    assert stored_state(entry) == winner_state[0]
+    assert load(entry).entry_id == winner[0].entry_id
 
 
 @pytest.mark.parametrize('operation', ['definition', 'request', 'reservation', 'ordinary'])

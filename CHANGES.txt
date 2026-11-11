@@ -29,6 +29,10 @@ Splunk-maintained changes
     Assign an entry_id on guarded creation and reject stale writes after
     deletion and recreation under the same key. Keep existing legacy entries
     without an identity unchanged instead of assigning one during reload.
+    Assign the caller's creation identity only after the Redis write succeeds.
+  - Raise EntryAlreadyExists, a ValueError subtype, when either creation API
+    finds a winning entry. First-due creation uses the same three-attempt
+    WATCH handling so callers can distinguish this race from invalid input.
   - Store policy fingerprints and creation identities as JSON values so both
     text and byte Redis responses use the same decoding path.
   - Keep from_key() on the existing HGET pipeline pattern, without duplicate

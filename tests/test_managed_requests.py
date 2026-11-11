@@ -5,7 +5,7 @@ import pytest
 from celery.schedules import schedule
 from redis.exceptions import WatchError
 
-from redbeat.schedulers import RedBeatScheduler
+from redbeat.schedulers import RedBeatScheduler, RedBeatSchedulerEntry
 from tests.test_jitter_concurrent_updates import app as request_app
 from tests.test_jitter_concurrent_updates import create_entry, load
 from tests.test_jitter_integration import NOW
@@ -94,6 +94,64 @@ def test_repeated_deferred_requests_keep_earliest_due_and_latest_payload(app):
         'jitter_fingerprint',
         'entry_id',
     }
+
+
+@pytest.mark.parametrize('new_interval', [60, 120])
+@pytest.mark.parametrize('request_seconds', [10, 40])
+def test_refresh_preserves_pending_first_arguments_and_earliest_deadline(
+    app, new_interval, request_seconds
+):
+    entry = create_entry(app, NOW + timedelta(seconds=20), first_run_kwargs={'bootstrap': 'first'})
+    entry.kwargs = {'revision': 'latest'}
+    entry.schedule = schedule(new_interval, app=app)
+    entry.request_run(
+        NOW + timedelta(seconds=request_seconds),
+        fingerprint=entry.jitter_fingerprint,
+        preserve_first_run_kwargs=True,
+    )
+    stored = load(entry)
+    due = NOW + timedelta(seconds=min(20, request_seconds))
+    assert stored.first_run_kwargs == {'bootstrap': 'first'}
+    assert stored.kwargs == {'revision': 'latest'}
+    assert stored.last_run_at + stored.schedule.run_every == due
+    assert stored.total_run_count == 0
+    app.now = lambda: due
+    outgoing = next(stored)
+    assert outgoing.kwargs == {'revision': 'latest', 'bootstrap': 'first'}
+    assert load(entry).first_run_kwargs == {}
+    assert load(entry).total_run_count == 1
+
+
+def test_refresh_does_not_restore_already_consumed_first_arguments(app):
+    entry = create_entry(app, first_run_kwargs={'bootstrap': 'first'})
+    stale = load(entry)
+    next(entry)
+    stale.request_run(NOW + timedelta(seconds=20), preserve_first_run_kwargs=True)
+    stored = load(entry)
+    assert stored.first_run_kwargs == {}
+    assert stored.total_run_count == 1
+    app.now = lambda: NOW + timedelta(seconds=20)
+    assert 'bootstrap' not in next(stored).kwargs
+
+
+@pytest.mark.parametrize('writer', ['save', 'reschedule'])
+@pytest.mark.parametrize('loaded', [False, True])
+def test_legacy_immediate_write_does_not_inherit_a_managed_deadline(app, writer, loaded):
+    original = create_entry(app, NOW + timedelta(seconds=20))
+    if loaded:
+        entry = load(original)
+    else:
+        entry = RedBeatSchedulerEntry(original.name, original.task, schedule(60, app=app), app=app)
+    entry.run_immediately = True
+    getattr(entry, writer)()
+    stored = load(original)
+    assert entry.jitter_fingerprint is None
+    assert stored.jitter_fingerprint is None
+    assert stored.entry_id == original.entry_id
+    assert stored.is_due()[0]
+    next(stored)
+    assert load(original).last_run_at == NOW
+    assert load(original).total_run_count == 1
 
 
 def test_definition_update_preserves_complete_pending_state(app):
