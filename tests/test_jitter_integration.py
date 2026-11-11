@@ -88,7 +88,10 @@ def read_message(queue):
         return None
 
 
-@pytest.mark.parametrize('interval,first_delay', [(60, 102), (300, 356), (600, 22), (1800, 35)])
+@pytest.mark.parametrize(
+    'interval,first_delay',
+    [(60, 102), (300, 356), (600, 22), (1800, 35), (1.5, 2.25), (0.5, 0.000001)],
+)
 def test_real_redis_reload_lookahead_and_beat_publication(app, interval, first_delay):
     app.now = lambda: NOW
     due = NOW + timedelta(seconds=first_delay)
@@ -96,7 +99,7 @@ def test_real_redis_reload_lookahead_and_beat_publication(app, interval, first_d
         name='test-first-run',
         task='tasks.test',
         schedule=schedule(interval, app=app),
-        kwargs={'address': 'router-01:161'},
+        kwargs={'job_id': 'job-01'},
         options={'expires': 120},
         app=app,
     )
@@ -105,8 +108,8 @@ def test_real_redis_reload_lookahead_and_beat_publication(app, interval, first_d
     assert loaded.last_run_at == due - timedelta(seconds=interval)
     assert loaded.jitter_fingerprint == FINGERPRINT
     assert app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, initial.key) == to_timestamp(due)
-    # An ordinary payload update must leave the first due unchanged.
-    loaded.kwargs['profile'] = 'updated'
+    # Updating the payload must preserve the stored first due.
+    loaded.kwargs['revision'] = 'updated'
     loaded.update_definition()
     scheduler = RedBeatScheduler(app, lazy=True, max_interval=3600)
     with app.connection_for_read() as connection:
@@ -114,7 +117,8 @@ def test_real_redis_reload_lookahead_and_beat_publication(app, interval, first_d
         try:
             for now in (NOW, due - timedelta(microseconds=1)):
                 app.now = lambda: now
-                assert 'test-first-run' in scheduler.schedule  # Real lookahead.
+                # Selection can include the entry before is_due() permits dispatch.
+                assert 'test-first-run' in scheduler.schedule
                 scheduler.tick()
                 assert read_message(queue) is None
             app.now = lambda: due
@@ -124,7 +128,7 @@ def test_real_redis_reload_lookahead_and_beat_publication(app, interval, first_d
             message = read_message(queue)
             assert message is not None
             assert message.payload[1]['bootstrap_token'] == 'first'
-            assert message.payload[1]['profile'] == 'updated'
+            assert message.payload[1]['revision'] == 'updated'
             assert message.headers.get('expires') is not None
             message.ack()
             assert read_message(queue) is None
@@ -152,12 +156,13 @@ def test_real_redis_reload_lookahead_and_beat_publication(app, interval, first_d
             scheduler.close()
 
 
-def test_real_clock_dispatch_is_not_early_and_recurs(app):
-    due = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=2)
+@pytest.mark.parametrize('interval', [2, 0.5])
+def test_real_clock_dispatch_is_not_early_and_recurs(app, interval):
+    due = datetime.now(timezone.utc) + timedelta(seconds=2)
     initial = RedBeatSchedulerEntry(
         'real-clock-test',
         'tasks.test',
-        schedule(2, app=app),
+        schedule(interval, app=app),
         app=app,
     ).save_with_first_due(due, FINGERPRINT)
     scheduler = RedBeatScheduler(app, lazy=True, max_interval=0.05)
@@ -175,8 +180,8 @@ def test_real_clock_dispatch_is_not_early_and_recurs(app):
                 time.sleep(0.02)
             assert len(observed) == 2
             assert timedelta(0) <= observed[0] - due < timedelta(seconds=1)
-            # Ordinary interval starts at reservation, not at the old hash phase.
-            assert 1.8 <= (observed[1] - observed[0]).total_seconds() < 3
+            # After the first reservation, runs follow the normal interval.
+            assert interval - 0.2 <= (observed[1] - observed[0]).total_seconds() < interval + 1
             assert RedBeatSchedulerEntry.from_key(initial.key, app).total_run_count == 2
         finally:
             queue.close()

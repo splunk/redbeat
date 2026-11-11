@@ -71,3 +71,32 @@ As a result most datetime objects need to be timezone aware.
     due_at, returns aware datetime
     to_timestamp(), accepts aware datetime, returns seconds since epoch (UTC)
     score(), returns seconds since epoch for due_at
+
+Explicit interval deadlines
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The opt-in ``save_with_first_due()`` and ``request_run()`` methods accept
+timezone-aware deadlines. RedBeat converts them to UTC before calculating the
+matching interval anchor. Fractional seconds in the deadline and interval are
+preserved in JSON metadata. These methods require a positive, non-relative
+interval schedule. Calendar schedules and relative rounding do not use this
+anchor calculation. Other scheduling APIs keep their existing behavior.
+
+The optional ``redbeat_entry_policy`` callback can select a following deadline
+under the same rules. It does not move the current saved invocation. Applications
+own their policy, including any jitter window, identity hashing, whole-second
+rounding or exceptions for urgent work. RedBeat stores the supplied timing and
+protects managed writes against concurrent updates and schedule replacement.
+
+Redis lookup scores retain their existing whole-second precision. A candidate
+can therefore be selected before a fractional deadline. The full-precision due
+check still prevents early publication. Beat wake-up frequency, broker latency
+and worker capacity can delay dispatch or execution. Subsecond timing is not a
+real-time execution guarantee.
+
+Entry loading follows the existing pipeline read pattern. Standalone Redis and
+Sentinel use the client's default transactional pipeline. A non-transactional
+read, including a default Cluster pipeline, does not guarantee a consistent
+snapshot if another client deletes and recreates the same key during that read.
+There is no load-time retry or duplicate identity read. Managed writes still
+check the loaded creation identity and applied policy before saving.
