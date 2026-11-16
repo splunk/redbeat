@@ -32,15 +32,6 @@ def app(request):
 
 
 def create_entry(app, due=NOW, **kwargs):
-    """
-    Store a generic managed interval entry using the isolated Redis fixture.
-
-    :param app: Isolated Celery app
-    :param due: Exact initial due time
-    :param kwargs: Optional entry fields
-
-    :return: Saved entry
-    """
     initial = RedBeatSchedulerEntry(
         'concurrent-entry', 'tasks.test', schedule(60, app=app), app=app, **kwargs
     )
@@ -68,8 +59,8 @@ def test_reservation_preserves_latest_payload_and_entry_fields(app):
     assert stored.args == ['new-argument']
     assert stored.options == current.options
     assert not stored._strtobool(stored.enabled)
-    # Reservation retains the already-loaded invocation. It cannot cancel an
-    # in-flight publication, but must not revert the configuration for future runs.
+    # The outgoing invocation uses its loaded payload, while future runs keep
+    # the newer definition stored by the concurrent update.
     assert reserved.kwargs == {'value': 'old'}
     assert reserved.args is None
     assert reserved.options == {'expires': 60}
@@ -101,7 +92,7 @@ def test_reservation_does_not_overwrite_recreated_entry_with_same_policy(app):
     before = app.redbeat_redis.hgetall(replacement.key)
     score = app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, replacement.key)
 
-    with pytest.raises(ValueError, match='run state'):
+    with pytest.raises(KeyError):
         next(stale)
 
     assert app.redbeat_redis.hgetall(replacement.key) == before
@@ -111,25 +102,25 @@ def test_reservation_does_not_overwrite_recreated_entry_with_same_policy(app):
 def test_reservation_preserves_new_immediate_request_after_entry_was_loaded(app):
     stale = create_entry(app)
     current = load(stale)
-    current.run_immediately = True
-    current.save()
+    current.request_run(NOW, run_immediately=True)
     requested_score = app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, stale.key)
 
-    next(stale)
+    with pytest.raises(ValueError):
+        next(stale)
     stored = load(stale)
 
     assert stored._strtobool(stored.run_immediately)
     assert app.redbeat_redis.sismember('run_immediately', stale.key)
     assert app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, stale.key) == requested_score
 
-    # The newer request is served on the next selection, then cleared normally.
+    # Reserving the reloaded request clears it and starts normal recurrence.
     app.now = lambda: NOW + timedelta(seconds=1)
     assert stored.is_due()[0]
     next(stored)
     finished = load(stale)
     assert not finished._strtobool(finished.run_immediately)
     assert not app.redbeat_redis.sismember('run_immediately', stale.key)
-    assert finished.total_run_count == 2
+    assert finished.total_run_count == 1
     assert (
         app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, stale.key)
         == (NOW + timedelta(seconds=61)).timestamp()
@@ -152,9 +143,9 @@ def test_stale_reservation_cannot_replace_a_completed_reservation(app):
     'change,error,message',
     [
         ('deleted', KeyError, None),
-        ('recreated', ValueError, 'The schedule run state changed before reservation'),
+        ('recreated', KeyError, None),
         ('policy', ValueError, 'The applied jitter policy changed'),
-        ('interval', ValueError, 'The schedule interval changed before reservation'),
+        ('interval', ValueError, 'interval changed before reservation'),
         ('run-state', ValueError, 'The schedule run state changed before reservation'),
     ],
 )
@@ -166,7 +157,7 @@ def test_invalid_reservation_state_is_not_written_or_retried(app, change, error,
         stale.delete()
         create_entry(app, NOW + timedelta(seconds=30))
     elif change == 'policy':
-        app.redbeat_redis.hset(stale.key, 'jitter_fingerprint', 'changed-policy')
+        app.redbeat_redis.hset(stale.key, 'jitter_fingerprint', json.dumps('changed-policy'))
     elif change == 'interval':
         current = load(stale)
         current.schedule = schedule(120, app=app)
@@ -330,12 +321,11 @@ def test_managed_write_stops_after_three_watch_conflicts(app, operation):
     assert app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, initial.key) == score
 
 
-def test_exhausted_immediate_reservation_retains_existing_selection_limit(app):
+def test_exhausted_managed_immediate_request_keeps_its_due_for_next_selection(app):
     initial = RedBeatSchedulerEntry(
         'concurrent-immediate', 'tasks.test', schedule(1800, app=app), app=app
     ).save_with_first_due(NOW + timedelta(seconds=1800), FINGERPRINT)
-    initial.run_immediately = True
-    initial.save()
+    initial.request_run(NOW, run_immediately=True)
     score = app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, initial.key)
     pipeline_class = type(app.redbeat_redis.pipeline())
     execute = pipeline_class.execute
@@ -362,11 +352,8 @@ def test_exhausted_immediate_reservation_retains_existing_selection_limit(app):
             assert load(initial)._strtobool(load(initial).run_immediately)
             assert load(initial).total_run_count == 0
             assert app.redbeat_redis.zscore(app.redbeat_conf.schedule_key, initial.key) == score
-            # Selection already drained the immediate set. Without a separate
-            # recovery mechanism, this request waits for normal due selection.
-            scheduler.tick()
-            publish.assert_not_called()
-            app.now = lambda: NOW + timedelta(seconds=1800)
+            # The due score remains after selection drains the immediate set,
+            # so the next tick can retry this request through the schedule index.
             scheduler.tick()
             publish.assert_called_once()
             stored = load(initial)

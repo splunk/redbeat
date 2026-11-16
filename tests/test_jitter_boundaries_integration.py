@@ -133,13 +133,6 @@ def test_publication_failure_keeps_existing_reservation_boundary(app):
 
 
 def test_competing_creators_store_one_consistent_winner(app):
-    """
-    Race isolated creators and check that only one complete state is accepted.
-
-    :param app: App connected to disposable Redis
-
-    :return: None
-    """
     app.now = lambda: NOW
     start = Barrier(8)
 

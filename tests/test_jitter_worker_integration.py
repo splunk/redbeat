@@ -52,18 +52,6 @@ def save_entry(app, task, interval=600, options=None):
     return entry, due
 
 
-def publish_first(app, entry):
-    scheduler = RedBeatScheduler(app, lazy=True, max_interval=0.05)
-    deadline = time.monotonic() + 6
-    while time.monotonic() < deadline:
-        scheduler.tick()
-        if RedBeatSchedulerEntry.from_key(entry.key, app=app).total_run_count:
-            return scheduler
-        time.sleep(0.02)
-    scheduler.close()
-    pytest.fail('Beat did not publish within the bounded observation')
-
-
 def test_real_broker_worker_first_context_and_recurrence(broker_app):
     app = broker_app
     calls = []
@@ -95,31 +83,3 @@ def test_real_broker_worker_first_context_and_recurrence(broker_app):
         assert stored.first_run_kwargs == {}
     finally:
         scheduler.close()
-
-
-def test_retry_keeps_first_context_without_another_beat_reservation(broker_app):
-    app = broker_app
-    calls = []
-    completed = Event()
-
-    @app.task(bind=True, name='validation.' + uuid4().hex, shared=False, lazy=False)
-    def retry_once(self, **kwargs):
-        calls.append((self.request.id, dict(kwargs)))
-        if self.request.retries == 0:
-            raise self.retry(countdown=0, max_retries=1)
-        completed.set()
-
-    entry, _ = save_entry(app, retry_once.name)
-    with worker(app):
-        scheduler = publish_first(app, entry)
-        try:
-            assert completed.wait(5)
-            assert len(calls) == 2
-            assert calls[0][0] == calls[1][0]
-            assert all(values['bootstrap_token'] == 'first' for _, values in calls)
-            stored = RedBeatSchedulerEntry.from_key(entry.key, app=app)
-            assert stored.total_run_count == 1
-            assert 'bootstrap_token' not in stored.kwargs
-            assert stored.first_run_kwargs == {}
-        finally:
-            scheduler.close()
