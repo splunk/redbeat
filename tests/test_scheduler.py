@@ -10,6 +10,7 @@ from celery.beat import DEFAULT_MAX_INTERVAL
 from celery.schedules import schedstate, schedule
 from celery.utils.time import maybe_timedelta
 from redis import CredentialProvider
+from redis.exceptions import ConnectionError, ResponseError
 
 from redbeat import RedBeatScheduler
 from redbeat.schedulers import (
@@ -164,7 +165,14 @@ class test_RedBeatScheduler_tick(RedBeatSchedulerTestBase):
 
         with patch.object(self.s, 'send_task') as send_task:
             sleep = self.s.tick()
-            send_task.assert_called_with(e.task, e.args, e.kwargs, **self.s._maybe_due_kwargs)
+            send_task.assert_called_once()
+            args, options = send_task.call_args
+            self.assertEqual(args, (e.task, e.args, e.kwargs))
+            expected_options = dict(self.s._maybe_due_kwargs)
+            # Newer Celery adds a Beat-origin header. Older versions omit it.
+            if 'headers' in options:
+                expected_options['headers'] = {'celery_beat_task': True}
+            self.assertEqual(options, expected_options)
 
         self.assertEqual(sleep, 1.0)
 
@@ -191,6 +199,26 @@ class test_RedBeatScheduler_tick(RedBeatSchedulerTestBase):
         self.s.lock = None
         with self.assertRaises(AttributeError):
             self.s.tick()
+
+    def test_redis_selection_errors_propagate(self):
+        errors = [
+            ResponseError('Redis command failed'),
+            ConnectionError('Redis connection unavailable'),
+        ]
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                with (
+                    patch.object(
+                        RedBeatScheduler,
+                        'schedule',
+                        new_callable=mock.PropertyMock,
+                        side_effect=error,
+                    ),
+                    patch.object(self.s, 'maybe_due') as maybe_due,
+                ):
+                    with self.assertRaises(type(error)):
+                        self.s.tick()
+                    maybe_due.assert_not_called()
 
 
 class TestRedBeatSchedulerUpdateFromDict(RedBeatSchedulerTestBase):
